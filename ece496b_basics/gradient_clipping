@@ -1,0 +1,44 @@
+import torch
+
+
+# This function limits how big the gradients are.
+# It helps prevent unstable training.
+def clip_gradients(parameters, max_norm, eps=1e-6):
+
+    """
+    parameters: model weights (each has a gradient)
+    max_norm: the largest allowed total gradient size
+    eps: small number to prevent division by zero
+    """
+
+    # --------------------------------------------------
+    # 1) Collect all gradients
+    # --------------------------------------------------
+    # Only keep gradients that exist (some may be None)
+    grads = [p.grad for p in parameters if p.grad is not None]
+
+    # If there are no gradients, do nothing
+    if len(grads) == 0:
+        return
+
+    # --------------------------------------------------
+    # 2) Compute total L2 norm (global gradient size)
+    # --------------------------------------------------
+    # L2 norm = sqrt(sum of squares of all gradient values)
+    total_norm = torch.sqrt(
+        sum(torch.sum(g.detach() ** 2) for g in grads)
+    )
+
+    # --------------------------------------------------
+    # 3) Compute how much to scale gradients
+    # --------------------------------------------------
+    # If total_norm is bigger than max_norm,
+    # clip_coef will be less than 1.
+    clip_coef = max_norm / (total_norm + eps)
+
+    # --------------------------------------------------
+    # 4) Scale gradients only if they are too large
+    # --------------------------------------------------
+    if clip_coef < 1:
+        for g in grads:
+            g.mul_(clip_coef)  # scale gradient in-place

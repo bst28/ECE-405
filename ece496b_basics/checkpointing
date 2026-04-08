@@ -1,0 +1,59 @@
+# Helps Python understand type hints better (advanced feature)
+from __future__ import annotations
+
+# Import PyTorch
+import torch
+
+# These help us say what types of inputs we accept
+from typing import Union, BinaryIO, IO
+import os
+
+
+# This function SAVES training progress
+def save_checkpoint(model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    iteration: int,
+                    out: Union[str, os.PathLike, BinaryIO, IO[bytes]]) -> None:
+    """
+    Save model + optimizer + iteration to `out`
+    """
+
+    # We create a dictionary (a storage box) that holds:
+    # 1. What training step we are on
+    # 2. The model’s learned weights
+    # 3. The optimizer’s internal memory (like momentum values)
+    ckpt = {
+        "iteration": int(iteration),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+
+    # Save everything to a file (or file-like object)
+    torch.save(ckpt, out)
+
+
+
+# This function LOADS training progress
+def load_checkpoint(src: Union[str, os.PathLike, BinaryIO, IO[bytes]],
+                    model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer) -> int:
+    """
+    Load checkpoint and restore model + optimizer
+    """
+
+    # Read the saved file
+    # map_location="cpu" makes sure it loads safely even if GPU was used
+    ckpt = torch.load(src, map_location="cpu")
+
+    # Safety check: make sure the file is structured correctly
+    if not isinstance(ckpt, dict):
+        raise TypeError("Checkpoint format must be a dict.")
+
+    # Restore model weights
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    # Restore optimizer memory (like momentum)
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    # Return what training step we were on
+    return int(ckpt["iteration"])

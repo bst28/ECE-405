@@ -1,0 +1,326 @@
+# plot_learning_curves.py
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s == "" or s.lower() in {"nan", "none", "null"}:
+            return None
+        v = float(s)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _moving_average(y: List[float], window: int) -> List[float]:
+    if window <= 1 or len(y) == 0:
+        return y
+    window = min(window, len(y))
+    out = []
+    cumsum = 0.0
+    q: List[float] = []
+    for v in y:
+        q.append(v)
+        cumsum += v
+        if len(q) > window:
+            cumsum -= q.pop(0)
+        out.append(cumsum / len(q))
+    return out
+
+
+def _nice_label(path: Path) -> str:
+    # Make label from filename and parent folder (often contains lr / ablation name)
+    parts = []
+    if path.parent.name not in {"log", "."}:
+        parts.append(path.parent.name)
+    parts.append(path.stem)
+    return " / ".join(parts)
+
+
+# -----------------------------
+# Readers
+# -----------------------------
+def read_csv_or_tsv(path: Path) -> Dict[str, List[float]]:
+    """
+    Returns dict with possible keys:
+      step, loss, train_loss, val_loss
+    """
+    # Detect delimiter by extension (simple + reliable)
+    delim = "\t" if path.suffix.lower() in {".tsv"} else ","
+
+    rows: List[List[str]] = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter=delim)
+        for r in reader:
+            if not r:
+                continue
+            rows.append([c.strip() for c in r])
+
+    if not rows:
+        return {}
+
+    # If first row looks like header, use DictReader-style parsing
+    header = [h.lower() for h in rows[0]]
+    header_like = any(
+        k in header
+        for k in ["step", "iter", "iteration", "loss", "train_loss", "val_loss", "train", "val"]
+    )
+
+    data: Dict[str, List[float]] = {"step": [], "loss": [], "train_loss": [], "val_loss": []}
+
+    if header_like:
+        col = {name: idx for idx, name in enumerate(header)}
+
+        def get(row: List[str], *names: str) -> Optional[float]:
+            for n in names:
+                if n in col and col[n] < len(row):
+                    v = _to_float(row[col[n]])
+                    if v is not None:
+                        return v
+            return None
+
+        for r in rows[1:]:
+            step = get(r, "step", "iter", "iteration", "global_step")
+            loss = get(r, "loss")
+            tr = get(r, "train_loss", "train")
+            va = get(r, "val_loss", "valid_loss", "validation_loss", "val", "valid")
+
+            if step is None:
+                # If no step provided, infer by index (1,2,3,...)
+                step = float(len(data["step"]) + 1)
+
+            data["step"].append(step)
+            if loss is not None:
+                data["loss"].append(loss)
+            else:
+                data["loss"].append(float("nan"))
+
+            data["train_loss"].append(tr if tr is not None else float("nan"))
+            data["val_loss"].append(va if va is not None else float("nan"))
+    else:
+        # No header: assume at least 2 columns => step, loss
+        for r in rows:
+            if len(r) < 2:
+                continue
+            step = _to_float(r[0])
+            loss = _to_float(r[1])
+            if step is None:
+                step = float(len(data["step"]) + 1)
+            if loss is None:
+                continue
+            data["step"].append(step)
+            data["loss"].append(loss)
+            data["train_loss"].append(float("nan"))
+            data["val_loss"].append(float("nan"))
+
+    # Remove keys that are entirely empty / nan-ish
+    def all_nan(vals: List[float]) -> bool:
+        ok = 0
+        for v in vals:
+            if isinstance(v, float) and not math.isnan(v):
+                ok += 1
+        return ok == 0
+
+    if all_nan(data["loss"]) and all_nan(data["train_loss"]) and all_nan(data["val_loss"]):
+        return {}
+
+    return data
+
+
+def read_jsonl(path: Path) -> Dict[str, List[float]]:
+    """
+    Each line: {"step":..., "loss":..., "train_loss":..., "val_loss":...} (or similar)
+    """
+    data: Dict[str, List[float]] = {"step": [], "loss": [], "train_loss": [], "val_loss": []}
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            # common key variations
+            step = _to_float(obj.get("step", obj.get("iter", obj.get("iteration", obj.get("global_step")))))
+            loss = _to_float(obj.get("loss"))
+            tr = _to_float(obj.get("train_loss", obj.get("train")))
+            va = _to_float(obj.get("val_loss", obj.get("valid_loss", obj.get("val", obj.get("valid")))))
+
+            if step is None:
+                step = float(len(data["step"]) + 1)
+
+            data["step"].append(step)
+            data["loss"].append(loss if loss is not None else float("nan"))
+            data["train_loss"].append(tr if tr is not None else float("nan"))
+            data["val_loss"].append(va if va is not None else float("nan"))
+
+    # If nothing useful
+    if len(data["step"]) == 0:
+        return {}
+    return data
+
+
+def read_any(path: Path) -> Dict[str, List[float]]:
+    suf = path.suffix.lower()
+    if suf in {".csv", ".tsv"}:
+        return read_csv_or_tsv(path)
+    if suf in {".jsonl"}:
+        return read_jsonl(path)
+    return {}
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_curves(
+    series: List[Tuple[str, List[float], List[float]]],
+    title: str,
+    out_path: Path,
+    xlabel: str = "Step",
+    ylabel: str = "Loss",
+    ylog: bool = False,
+) -> None:
+    plt.figure(figsize=(10, 6))
+
+    any_plotted = False
+    for label, x, y in series:
+        # drop nan pairs
+        x2, y2 = [], []
+        for xi, yi in zip(x, y):
+            if yi is None:
+                continue
+            if isinstance(yi, float) and math.isnan(yi):
+                continue
+            x2.append(xi)
+            y2.append(yi)
+        if len(x2) < 2:
+            continue
+
+        plt.plot(x2, y2, linewidth=2, label=label)
+        any_plotted = True
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    if ylog:
+        plt.yscale("log")
+    if any_plotted:
+        plt.legend()
+        plt.tight_layout()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=200)
+        print(f"Saved: {out_path}")
+    else:
+        print(f"Skipped (no usable data): {out_path}")
+    plt.close()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--logdir", type=str, default="log", help="Folder to search for log")
+    ap.add_argument("--outdir", type=str, default="plots", help="Where to save plots")
+    ap.add_argument("--pattern", type=str, default="", help="Optional substring filter (e.g. 'lr_' or 'rmsnorm')")
+    ap.add_argument("--smooth", type=int, default=1, help="Moving average window (1 = off)")
+    ap.add_argument("--ylog", action="store_true", help="Log-scale y-axis")
+    args = ap.parse_args()
+
+    logdir = Path(args.logdir)
+    outdir = Path(args.outdir)
+
+    if not logdir.exists():
+        raise SystemExit(f"Log directory not found: {logdir.resolve()}")
+
+    # Find candidate files
+    candidates: List[Path] = []
+    for ext in ("*.csv", "*.tsv", "*.jsonl"):
+        candidates.extend(logdir.rglob(ext))
+
+    if args.pattern:
+        candidates = [p for p in candidates if args.pattern in str(p)]
+
+    if not candidates:
+        raise SystemExit(f"No log files found under {logdir.resolve()}")
+
+    # Collect series
+    train_series: List[Tuple[str, List[float], List[float]]] = []
+    val_series: List[Tuple[str, List[float], List[float]]] = []
+    loss_series: List[Tuple[str, List[float], List[float]]] = []
+
+    for p in sorted(candidates):
+        data = read_any(p)
+        if not data:
+            continue
+
+        steps = data["step"]
+        loss = _moving_average(data.get("loss", []), args.smooth)
+        train_loss = _moving_average(data.get("train_loss", []), args.smooth)
+        val_loss = _moving_average(data.get("val_loss", []), args.smooth)
+
+        label = _nice_label(p)
+
+        # Prefer train_loss if it exists; otherwise fall back to loss
+        if any(not (isinstance(v, float) and math.isnan(v)) for v in train_loss):
+            train_series.append((label, steps, train_loss))
+        if any(not (isinstance(v, float) and math.isnan(v)) for v in val_loss):
+            val_series.append((label, steps, val_loss))
+        if any(not (isinstance(v, float) and math.isnan(v)) for v in loss):
+            loss_series.append((label, steps, loss))
+
+    # Make plots (whatever exists)
+    if train_series:
+        plot_curves(
+            train_series,
+            title="Learning Curves (Train Loss)",
+            out_path=outdir / "learning_curve_train.png",
+            ylabel="Train Loss",
+            ylog=args.ylog,
+        )
+
+    if val_series:
+        plot_curves(
+            val_series,
+            title="Learning Curves (Validation Loss)",
+            out_path=outdir / "learning_curve_val.png",
+            ylabel="Val Loss",
+            ylog=args.ylog,
+        )
+
+    # If you only have a generic "loss" column, this still gives you a curve
+    if loss_series and not train_series:
+        plot_curves(
+            loss_series,
+            title="Learning Curves (Loss)",
+            out_path=outdir / "learning_curve_loss.png",
+            ylabel="Loss",
+            ylog=args.ylog,
+        )
+
+    if not (train_series or val_series or loss_series):
+        raise SystemExit("Found log files, but none contained usable step/loss data.")
+
+
+if __name__ == "__main__":
+    main()

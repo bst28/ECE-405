@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+# Try importing from the package (works in pytest),
+# otherwise import locally if running this file directly
+try:
+    from .embedding import Embedding
+    from .transformer_block import TransformerBlock
+    from .linear import Linear
+except ImportError:  # running as a script (no package context)
+    from embedding import Embedding  # type: ignore
+    from transformer_block import TransformerBlock  # type: ignore
+    from linear import Linear  # type: ignore
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        device=None,
+        dtype=None,
+    ) -> None:
+        # Initialize parent PyTorch module
+        super().__init__()
+
+        # Save model hyperparameters
+        self.vocab_size = int(vocab_size)
+        self.context_length = int(context_length)
+        self.num_layers = int(num_layers)
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.d_ff = int(d_ff)
+
+        # Token embedding layer (turns token IDs into vectors)
+        self.tok_emb = Embedding(
+            num_embeddings=self.vocab_size,
+            embedding_dim=self.d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Stack multiple Transformer blocks
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=self.d_model,
+                    num_heads=self.num_heads,
+                    d_ff=self.d_ff,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+
+        # Final linear layer that maps hidden states to vocab logits
+        self.lm_head = Linear(
+            in_features=self.d_model,
+            out_features=self.vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        token_ids: (batch, seq_len)
+        returns:   (batch, seq_len, vocab_size)
+        """
+
+        # Get batch size and sequence length
+        b, t = token_ids.shape
+
+        # Prevent sequences longer than the model context window
+        if t > self.context_length:
+            raise ValueError("seq_len exceeds context_length")
+
+        # Convert token IDs to embeddings
+        x = self.tok_emb(token_ids)  # (b, t, d_model)
+
+        # Pass through each Transformer block
+        for blk in self.blocks:
+            x = blk(x)
+
+        # Project final hidden states to vocabulary logits
+        logits = self.lm_head(x)  # (b, t, vocab_size)
+        return logits

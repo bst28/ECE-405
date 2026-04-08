@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import torch
+
+
+def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute mean cross-entropy loss:
+      loss = -log softmax(logits)[targets]
+
+    Requirements:
+      - subtract max for numerical stability
+      - cancel log/exp whenever possible
+      - support any number of leading batch-like dims
+      - average across all batch-like dims
+
+    Shapes:
+      logits:  (..., vocab_size)
+      targets: (...,)  integer class indices
+    Returns:
+      scalar tensor (0-dim): mean loss
+    """
+    if logits.ndim < 1:
+        raise ValueError("logits must have at least 1 dimension (..., vocab_size)")
+    if targets.shape != logits.shape[:-1]:
+        raise ValueError(
+            f"targets shape {targets.shape} must match logits batch shape {logits.shape[:-1]}"
+        )
+
+    # 1) subtract max for numerical stability
+    max_logits = logits.max(dim=-1, keepdim=True).values
+    shifted = logits - max_logits  # (..., vocab_size)
+
+    # 2) stable logsumexp (this avoids explicitly doing log(exp(.)))
+    lse = torch.logsumexp(shifted, dim=-1)  # (...,)
+
+    # 3) pick the shifted logit at the target index
+    tgt = targets.to(dtype=torch.long).unsqueeze(-1)               # (..., 1)
+    shifted_tgt = shifted.gather(dim=-1, index=tgt).squeeze(-1)    # (...,)
+
+    # 4) -log softmax(target) = logsumexp - shifted_target
+    loss = lse - shifted_tgt  # (...,)
+
+    # 5) average across all batch-like dims
+    return loss.mean()

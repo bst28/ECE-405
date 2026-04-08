@@ -1,0 +1,68 @@
+import math
+
+
+def get_lr_cosine_schedule(t: int, alpha_max: float, alpha_min: float, Tw: int, Tc: int) -> float:
+    """
+    Cosine learning rate schedule with linear warmup.
+
+    - Warmup: increase from 0 → alpha_max
+    - Cosine: smoothly decay from alpha_max → alpha_min
+    - After schedule: stay at alpha_min
+    """
+
+    # Make sure inputs are integers where needed
+    t = int(t)     # current step
+    Tw = int(Tw)   # warmup steps
+    Tc = int(Tc)   # total schedule length
+
+    # ----------------------------------------
+    # Handle weird edge cases safely
+    # ----------------------------------------
+
+    # If total schedule length is invalid, just return alpha_min
+    if Tc <= 0:
+        return float(alpha_min)
+
+    # Warmup cannot be negative
+    if Tw < 0:
+        Tw = 0
+
+    # Make sure total schedule isn't shorter than warmup
+    if Tc < Tw:
+        Tc = Tw
+
+    # ----------------------------------------
+    # 1) Warmup phase
+    # ----------------------------------------
+    # If we are still in warmup,
+    # increase learning rate linearly
+    if Tw > 0 and t < Tw:
+        return float(alpha_max) * (t / Tw)
+
+    # ----------------------------------------
+    # 2) Cosine decay phase
+    # ----------------------------------------
+    if t <= Tc:
+
+        # Length of cosine decay region
+        denom = (Tc - Tw)
+
+        # If warmup and total steps are the same,
+        # we immediately go to alpha_min
+        if denom <= 0:
+            return float(alpha_min) if t >= Tw else 0.0
+
+        # How far we are through cosine decay (0 → 1)
+        progress = (t - Tw) / denom
+
+        # Cosine curve between 1 and 0
+        cos_term = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        # Scale between alpha_max and alpha_min
+        return float(alpha_min) + (float(alpha_max) - float(alpha_min)) * cos_term
+
+    # ----------------------------------------
+    # 3) After schedule ends
+    # ----------------------------------------
+    # Once past Tc, keep learning rate at alpha_min
+    return float(alpha_min)

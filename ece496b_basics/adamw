@@ -1,0 +1,129 @@
+# This just helps Python understand type hints better (advanced feature).
+from __future__ import annotations
+
+# These are tools we import so we can use them.
+from typing import Iterable, Optional, Callable, Dict, Any
+import math
+import torch
+from torch.optim import Optimizer
+
+
+# We are creating our own version of the AdamW optimizer.
+# Optimizer is the base class from PyTorch that all optimizers come from.
+class AdamW(Optimizer):
+
+    # This runs when we FIRST create the optimizer.
+    # It sets up all the settings.
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],  # the model's weights
+        lr: float = 1e-3,                      # how big of a step we take each update
+        betas: tuple[float, float] = (0.9, 0.999),  # momentum settings
+        eps: float = 1e-8,                     # tiny number to prevent dividing by zero
+        weight_decay: float = 0.0,             # how much we shrink weights
+    ) -> None:
+
+        # These next lines are safety checks.
+        # They stop the program if you give bad values.
+
+        if lr < 0.0:
+            raise ValueError("lr must be >= 0")
+
+        if eps < 0.0:
+            raise ValueError("eps must be >= 0")
+
+        b1, b2 = betas
+        if not (0.0 <= b1 < 1.0 and 0.0 <= b2 < 1.0):
+            raise ValueError("betas must be in [0, 1)")
+
+        if weight_decay < 0.0:
+            raise ValueError("weight_decay must be >= 0")
+
+        # We store all these settings in a dictionary.
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+        # This calls the parent Optimizer class to finish setup.
+        super().__init__(params, defaults)
+
+
+    # This function runs EVERY time we update the model.
+    # It changes the weights a little bit.
+    @torch.no_grad()  # tells PyTorch not to track gradients here
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+
+        loss = None
+
+        # Sometimes we recompute the loss (not always used)
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # Loop through groups of parameters (usually just one group)
+        for group in self.param_groups:
+
+            # Get the settings for this group
+            lr: float = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps: float = group["eps"]
+            wd: float = group["weight_decay"]
+
+            # Loop through each weight in the model
+            for p in group["params"]:
+
+                # If this weight has no gradient, skip it
+                if p.grad is None:
+                    continue
+
+                grad = p.grad  # this is the slope (how wrong we are)
+
+                # AdamW does NOT support sparse gradients
+                if grad.is_sparse:
+                    raise RuntimeError("AdamW does not support sparse gradients")
+
+                # Each weight keeps its own memory (state)
+                state: Dict[str, Any] = self.state[p]
+
+                # If this is the first time we see this weight,
+                # we create storage for it
+                if len(state) == 0:
+                    state["step"] = 0  # how many updates so far
+                    state["exp_avg"] = torch.zeros_like(p)      # moving average of gradients
+                    state["exp_avg_sq"] = torch.zeros_like(p)   # moving average of squared gradients
+
+                # Increase step counter
+                state["step"] += 1
+                t = state["step"]
+
+                # Get stored moving averages
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+
+                # --- Weight Decay ---
+                # This slightly shrinks the weight every step
+                # Helps prevent overfitting
+                if wd != 0:
+                    p.add_(p, alpha=-lr * wd)
+
+                # --- Update moving averages ---
+                # This is momentum (smooths updates)
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+
+                # This tracks squared gradients
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                # --- Bias correction ---
+                # Early steps are biased, so we correct them
+                bias_c1 = 1.0 - beta1**t
+                bias_c2 = 1.0 - beta2**t
+
+                m_hat = exp_avg / bias_c1
+                v_hat = exp_avg_sq / bias_c2
+
+                # --- Final parameter update ---
+                # Divide by sqrt of squared average (adaptive step size)
+                denom = v_hat.sqrt().add_(eps)
+
+                # Actually update the weight
+                p.addcdiv_(m_hat, denom, value=-lr)
+
+        return loss

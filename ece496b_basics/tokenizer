@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Iterable, Iterator, Optional
+import json
+import ast
+import re
+from pathlib import Path
+
+
+# A merge is a pair of byte-tokens (a, b) that can be merged into (a+b)
+BytesPair = Tuple[bytes, bytes]
+
+
+def _to_bytes(x) -> bytes:
+    """
+    Convert different token formats into real bytes.
+    This lets us load vocab/merges from files even if they store tokens differently.
+    """
+    # If it's already bytes, return it
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+
+    # If it's a list of integers, treat them as byte values
+    if isinstance(x, list):
+        # e.g., [65, 66, 67] -> b"ABC"
+        return bytes(x)
+
+    # If it's a string, try to interpret it
+    if isinstance(x, str):
+        s = x.strip()
+
+        # If it looks like a bytes literal string (like "b'\\x00A'"), try parsing it
+        if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
+            try:
+                v = ast.literal_eval(s)
+                if isinstance(v, (bytes, bytearray)):
+                    return bytes(v)
+            except Exception:
+                pass
+
+        # Otherwise treat it as normal text and encode to utf-8 bytes
+        return s.encode("utf-8")
+
+    # If we get here, we don't know how to convert it
+    raise TypeError(f"Cannot convert to bytes: {type(x)}")
+
+
+def _merge_pair_everywhere(tokens: List[bytes], a: bytes, b: bytes) -> List[bytes]:
+    """
+    Merge all adjacent occurrences of (a, b) into (a+b) in one left-to-right pass.
+    Example: [a, b, x] -> [a+b, x]
+    """
+    if len(tokens) < 2:
+        return tokens
+
+    out: List[bytes] = []
+    i = 0
+    ab = a + b
+    n = len(tokens)
+
+    # Scan through tokens and merge when we see (a followed by b)
+    while i < n:
+        if i < n - 1 and tokens[i] == a and tokens[i + 1] == b:
+            out.append(ab)
+            i += 2  # skip the two tokens we just merged
+        else:
+            out.append(tokens[i])
+            i += 1
+
+    return out
+
+
+@dataclass
+class Tokenizer:
+    # vocab maps id -> bytes token
+    vocab: Dict[int, bytes]
+
+    # merges is a list of merge rules (a, b) that can be merged
+    merges: List[BytesPair]
+
+    # optional list of special tokens like "<BOS>", "<EOS>", etc.
+    special_tokens: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        # Copy vocab to an internal id->token dict
+        self.id_to_token: Dict[int, bytes] = dict(self.vocab)
+
+        # Build reverse map: token bytes -> id
+        self.token_to_id: Dict[bytes, int] = {b: i for i, b in self.id_to_token.items()}
+
+        # Make sure special_tokens is a list (not None)
+        self.special_tokens = list(self.special_tokens) if self.special_tokens else []
+        self.special_token_to_id: Dict[str, int] = {}
+
+        # Ensure each special token exists in vocab and has an id
+        for st in self.special_tokens:
+            b = st.encode("utf-8")
+            if b in self.token_to_id:
+                sid = self.token_to_id[b]
+            else:
+                # Add special token to vocab using the next available integer id
+                sid = (max(self.id_to_token.keys()) + 1) if self.id_to_token else 0
+                self.id_to_token[sid] = b
+                self.token_to_id[b] = sid
+            self.special_token_to_id[st] = sid
+
+        # Build a regex that matches any special token in the text
+        # Longest-first avoids prefix issues (like "<A>" vs "<A_B>")
+        self._special_re: Optional[re.Pattern[str]] = None
+        if self.special_tokens:
+            escaped = sorted((re.escape(s) for s in self.special_tokens), key=len, reverse=True)
+            self._special_re = re.compile("(" + "|".join(escaped) + ")")
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: Optional[List[str]] = None,
+    ) -> "Tokenizer":
+        """
+        Load vocab and merges from disk (supports multiple common formats).
+        """
+        vp = Path(vocab_filepath)
+        mp = Path(merges_filepath)
+
+        # ---- load vocab ----
+        vocab_raw = json.loads(vp.read_text(encoding="utf-8"))
+        vocab: Dict[int, bytes] = {}
+
+        # Convert each vocab entry into bytes
+        for k, v in vocab_raw.items():
+            idx = int(k) if isinstance(k, str) else int(k)
+            vocab[idx] = _to_bytes(v)
+
+        # ---- load merges ----
+        merges: List[BytesPair] = []
+        text = mp.read_text(encoding="utf-8")
+
+        # First try to read merges as JSON
+        loaded_json = False
+        try:
+            maybe = json.loads(text)
+            if isinstance(maybe, list):
+                for pair in maybe:
+                    if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+                        raise ValueError("Bad merge pair")
+                    merges.append((_to_bytes(pair[0]), _to_bytes(pair[1])))
+                loaded_json = True
+        except Exception:
+            loaded_json = False
+
+        # If not JSON, treat it as a text file: "tok1 tok2" per line
+        if not loaded_json:
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                a = _to_bytes(parts[0])
+                b = _to_bytes(parts[1])
+                merges.append((a, b))
+
+        # Build and return Tokenizer object
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+    def _encode_bytes_bpe(self, raw: bytes) -> List[int]:
+        """
+        Encode raw bytes using BPE merges, returning token IDs.
+        """
+        # Start with one token per byte
+        tokens: List[bytes] = [bytes([b]) for b in raw]
+
+        # Apply merges in the given order (BPE rules)
+        for a, b in self.merges:
+            tokens = _merge_pair_everywhere(tokens, a, b)
+
+        # Convert byte-tokens into integer IDs
+        ids: List[int] = []
+        for t in tokens:
+            if t not in self.token_to_id:
+                # This means vocab is missing a token we produced
+                raise KeyError(f"Token bytes not in vocab: {t!r}")
+            ids.append(self.token_to_id[t])
+
+        return ids
+
+    def encode(self, text: str) -> List[int]:
+        """
+        Encode text into token ids, respecting special tokens.
+        """
+        if not text:
+            return []
+
+        # If there are no special tokens, just BPE-encode everything
+        if not self._special_re:
+            return self._encode_bytes_bpe(text.encode("utf-8"))
+
+        # If there ARE special tokens, split text around them
+        ids: List[int] = []
+        pos = 0
+
+        for m in self._special_re.finditer(text):
+            start, end = m.span()
+
+            # Encode normal text before the special token
+            if start > pos:
+                chunk = text[pos:start]
+                ids.extend(self._encode_bytes_bpe(chunk.encode("utf-8")))
+
+            # Add the special token id
+            st = m.group(0)
+            ids.append(self.special_token_to_id[st])
+            pos = end
+
+        # Encode remaining normal text after the last special token
+        if pos < len(text):
+            ids.extend(self._encode_bytes_bpe(text[pos:].encode("utf-8")))
+
+        return ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Encode many strings lazily (useful for files/streams).
+        """
+        for s in iterable:
+            for tid in self.encode(s):
+                yield tid
+
+    def decode(self, ids: List[int]) -> str:
+        """
+        Decode token ids back into text.
+        """
+        # Convert ids -> bytes and join into one byte string
+        b = b"".join(self.id_to_token[i] for i in ids)
+
+        # Decode bytes to utf-8 text (replace invalid bytes safely)
+        return b.decode("utf-8", errors="replace")

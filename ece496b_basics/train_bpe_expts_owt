@@ -1,0 +1,37 @@
+from datasets import load_dataset
+
+# Load the OpenWebText dataset
+dataset = load_dataset("openwebtext")
+
+
+from pathlib import Path
+from train_bpe import train_bpe
+import pickle
+
+# Get the directory this script is in
+HERE = Path(__file__).resolve().parent
+
+# Path to the training text file (must be in the same folder)
+input_path = HERE / "openwebtext.txt"
+
+# Train a byte-pair encoding (BPE) tokenizer
+vocab, merges = train_bpe(
+    input_path=str(input_path),
+    vocab_size=32000,
+    special_tokens=[]
+)
+
+# Save the learned vocabulary to disk
+with open(HERE / "vocab_owt.pkl", "wb") as f:
+    pickle.dump(vocab, f)
+
+# Save the learned merge rules to disk
+with open(HERE / "merges_owt.pkl", "wb") as f:
+    pickle.dump(merges, f)
+
+# Find the longest token in the vocabulary (in bytes)
+longest = max(vocab.values(), key=len)
+
+# Print the longest token and its length
+print("Longest token (bytes):", longest)
+print("Length:", len(longest))

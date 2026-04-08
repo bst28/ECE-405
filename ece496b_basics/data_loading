@@ -1,0 +1,67 @@
+import numpy as np
+import torch
+
+
+# This function creates a training batch from a long list of token IDs.
+# Think of x as one long sentence of numbers.
+def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str):
+
+    """
+    It returns:
+      inputs  -> what we feed into the model
+      targets -> what we want the model to predict
+    """
+
+    # Total number of tokens in the dataset
+    n = int(x.shape[0])
+
+    # How many tokens each example should contain
+    m = int(context_length)
+
+    # Make sure we have enough tokens to create input + target
+    if n < m + 1:
+        raise ValueError(
+            f"x is too short: len(x)={n}, need at least context_length+1={m+1}"
+        )
+
+    # --------------------------------------------------
+    # 1) Randomly choose starting positions
+    # --------------------------------------------------
+    # Each start defines one training example.
+    # We choose them randomly so training sees different parts each time.
+    starts = np.random.randint(
+        0, n - m - 1 + 1,  # valid range
+        size=(batch_size,)
+    )
+
+    # --------------------------------------------------
+    # 2) Build input sequences
+    # --------------------------------------------------
+    # For each starting position,
+    # take context_length tokens.
+    inp = np.stack(
+        [x[s : s + m] for s in starts],
+        axis=0
+    )
+
+    # --------------------------------------------------
+    # 3) Build target sequences
+    # --------------------------------------------------
+    # Targets are the SAME sequence,
+    # but shifted one step to the right.
+    # This teaches the model to predict the next token.
+    tgt = np.stack(
+        [x[s + 1 : s + 1 + m] for s in starts],
+        axis=0
+    )
+
+    # --------------------------------------------------
+    # 4) Convert numpy arrays into PyTorch tensors
+    # --------------------------------------------------
+    # .long() ensures integer type (needed for token IDs)
+    # .to(device) moves data to CPU or GPU
+    inp_t = torch.from_numpy(inp).long().to(device)
+    tgt_t = torch.from_numpy(tgt).long().to(device)
+
+    # Return inputs and targets
+    return inp_t, tgt_t

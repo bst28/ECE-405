@@ -1,0 +1,407 @@
+from __future__ import annotations
+
+import argparse
+import importlib
+import math
+import os
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ----------------------------
+# Utilities (LR schedule, grad clip, checkpoints)
+# ----------------------------
+
+def get_lr_cosine_schedule(t: int, alpha_max: float, alpha_min: float, Tw: int, Tc: int) -> float:
+    # Linear warmup to alpha_max, then cosine decay to alpha_min, then stay at alpha_min
+    t = int(t); Tw = int(Tw); Tc = int(Tc)
+
+    # If cosine phase is disabled, just return the minimum LR
+    if Tc <= 0:
+        return float(alpha_min)
+
+    # Keep inputs safe
+    if Tw < 0:
+        Tw = 0
+    if Tc < Tw:
+        Tc = Tw
+
+    # Warmup: ramp up LR from 0 -> alpha_max
+    if Tw > 0 and t < Tw:
+        return float(alpha_max) * (t / Tw)
+
+    # Cosine decay: alpha_max -> alpha_min
+    if t <= Tc:
+        denom = Tc - Tw
+        if denom <= 0:
+            return float(alpha_min)
+        progress = (t - Tw) / denom  # goes from 0 to 1
+        cos_term = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return float(alpha_min) + (float(alpha_max) - float(alpha_min)) * cos_term
+
+    # After Tc: stay at alpha_min
+    return float(alpha_min)
+
+
+def clip_gradients(parameters, max_norm: float, eps: float = 1e-6) -> None:
+    # Collect all gradients that exist
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return
+
+    # Compute total gradient norm (single number)
+    total_norm = torch.sqrt(sum(torch.sum(g.detach() ** 2) for g in grads))
+
+    # Compute scale factor so norm <= max_norm
+    coef = float(max_norm) / float(total_norm + eps)
+
+    # If too large, scale gradients down in-place
+    if coef < 1.0:
+        for g in grads:
+            g.mul_(coef)
+
+
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int, out: str | os.PathLike) -> None:
+    # Save model weights + optimizer state + current step
+    ckpt = {
+        "iteration": int(iteration),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    torch.save(ckpt, out)
+
+
+def load_checkpoint(src: str | os.PathLike, model: nn.Module, optimizer: torch.optim.Optimizer) -> int:
+    # Load checkpoint, restore model + optimizer, return saved iteration
+    ckpt = torch.load(src, map_location="cpu")
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    return int(ckpt["iteration"])
+
+
+# ----------------------------
+# Data loading (np.memmap token buffer)
+# ----------------------------
+
+def open_memmap_tokens(path: str | os.PathLike, dtype: str = "int32") -> np.memmap:
+    # Open a flat binary file of token IDs without loading it all into RAM
+    return np.memmap(path, mode="r", dtype=dtype)
+
+
+def get_batch_from_memmap(x: np.ndarray, batch_size: int, context_length: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    # x is a long 1D array of tokens
+    n = int(x.shape[0])
+    m = int(context_length)
+
+    # Need at least context_length + 1 tokens to make input/target
+    if n < m + 1:
+        raise ValueError(f"Token buffer too short: len={n}, need >= {m+1}")
+
+    # Pick random start indices for each sequence in the batch
+    starts = np.random.randint(0, n - m, size=(batch_size,))
+
+    # Build input sequences and target sequences (shifted by 1)
+    inp = np.stack([x[s:s + m] for s in starts], axis=0)
+    tgt = np.stack([x[s + 1:s + 1 + m] for s in starts], axis=0)
+
+    # Move to torch tensors on the right device
+    inp_t = torch.from_numpy(inp).long().to(device, non_blocking=True)
+    tgt_t = torch.from_numpy(tgt).long().to(device, non_blocking=True)
+    return inp_t, tgt_t
+
+
+# ----------------------------
+# Simple baseline language model (replace with your Transformer later)
+# ----------------------------
+
+class TinyLM(nn.Module):
+    """
+    Simple baseline: embedding + layernorm + small MLP -> vocab logits.
+    """
+    def __init__(self, vocab_size: int, d_model: int):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, d_model)
+        self.ln = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, 4 * d_model)
+        self.fc2 = nn.Linear(4 * d_model, vocab_size)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        # idx: (B,T) token IDs
+        x = self.emb(idx)              # (B,T,D) turn tokens into vectors
+        x = self.ln(x)                 # normalize
+        x = F.silu(self.fc1(x))        # hidden layer
+        logits = self.fc2(x)           # (B,T,V) scores for each vocab token
+        return logits
+
+
+# ----------------------------
+# Evaluation + optional Weights & Biases logging
+# ----------------------------
+
+@torch.no_grad()
+def estimate_loss(model: nn.Module, data: np.ndarray, steps: int, batch_size: int, context_length: int, device: str) -> float:
+    # Evaluate model loss on random batches
+    model.eval()
+    losses = []
+    for _ in range(steps):
+        xb, yb = get_batch_from_memmap(data, batch_size, context_length, device)
+        logits = model(xb)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
+        losses.append(float(loss.item()))
+    model.train()
+    return sum(losses) / max(1, len(losses))
+
+
+def try_init_wandb(enabled: bool, project: str, run_name: Optional[str], config: dict):
+    # Initialize wandb if enabled; otherwise return None
+    if not enabled:
+        return None
+    try:
+        wandb = importlib.import_module("wandb")
+        wandb.init(project=project, name=run_name, config=config)
+        return wandb
+    except Exception as e:
+        print(f"[warn] wandb disabled (failed to init): {e}")
+        return None
+
+
+# ----------------------------
+# Training config
+# ----------------------------
+
+@dataclass
+class TrainConfig:
+    # Data paths
+    train_path: str
+    val_path: str
+    dtype: str = "int32"
+
+    # Model sizes
+    vocab_size: int = 50257
+    d_model: int = 512
+
+    # Training settings
+    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    seed: int = 0
+    steps: int = 2000
+    batch_size: int = 16
+    context_length: int = 128
+
+    # Optimizer settings
+    lr_max: float = 3e-4
+    lr_min: float = 3e-5
+    warmup_steps: int = 200
+    cosine_steps: int = 2000
+    weight_decay: float = 0.1
+    betas0: float = 0.9
+    betas1: float = 0.999
+    eps: float = 1e-8
+
+    # Stability
+    grad_clip_norm: float = 1.0
+
+    # Logging / evaluation frequency
+    log_every: int = 50
+    eval_every: int = 200
+    eval_batches: int = 10
+
+    # Checkpointing
+    ckpt_path: str = "checkpoint.pt"
+    save_every: int = 500
+    resume: bool = False
+
+    # Weights & Biases
+    wandb: bool = False
+    wandb_project: str = "cs336-assignment1"
+    wandb_name: Optional[str] = None
+
+
+# ----------------------------
+# Main: parse args, build config, train
+# ----------------------------
+
+def main():
+    # Read command line arguments (so you can set paths/hyperparams without editing code)
+    parser = argparse.ArgumentParser()
+
+    # Required inputs: token files for train/val
+    parser.add_argument("--train_path", type=str, required=True)
+    parser.add_argument("--val_path", type=str, required=True)
+
+    # Common knobs
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--context_length", type=int, default=128)
+    parser.add_argument("--vocab_size", type=int, default=50257)
+    parser.add_argument("--d_model", type=int, default=512)
+
+    # LR schedule
+    parser.add_argument("--lr_max", type=float, default=3e-4)
+    parser.add_argument("--lr_min", type=float, default=3e-5)
+    parser.add_argument("--warmup_steps", type=int, default=200)
+    parser.add_argument("--cosine_steps", type=int, default=2000)
+
+    # Optimizer
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--betas0", type=float, default=0.9)
+    parser.add_argument("--betas1", type=float, default=0.999)
+    parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+
+    # Logging / eval / checkpoint
+    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--eval_every", type=int, default=200)
+    parser.add_argument("--eval_batches", type=int, default=10)
+    parser.add_argument("--ckpt_path", type=str, default="checkpoint.pt")
+    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--resume", action="store_true")
+
+    # W&B
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="cs336-assignment1")
+    parser.add_argument("--wandb_name", type=str, default=None)
+
+    args = parser.parse_args()
+
+    # Build config object from CLI args
+    cfg = TrainConfig(
+        train_path=args.train_path,
+        val_path=args.val_path,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        context_length=args.context_length,
+        vocab_size=args.vocab_size,
+        d_model=args.d_model,
+        lr_max=args.lr_max,
+        lr_min=args.lr_min,
+        warmup_steps=args.warmup_steps,
+        cosine_steps=args.cosine_steps,
+        weight_decay=args.weight_decay,
+        betas0=args.betas0,
+        betas1=args.betas1,
+        eps=args.eps,
+        grad_clip_norm=args.grad_clip_norm,
+        log_every=args.log_every,
+        eval_every=args.eval_every,
+        eval_batches=args.eval_batches,
+        ckpt_path=args.ckpt_path,
+        save_every=args.save_every,
+        resume=args.resume,
+        wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+    )
+
+    # If user set device explicitly, override default
+    if args.device is not None:
+        cfg.device = args.device
+
+    # Set random seeds for repeatable results
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    # Open token files using memmap (fast and memory efficient)
+    train_tokens = open_memmap_tokens(cfg.train_path, dtype=cfg.dtype)
+    val_tokens = open_memmap_tokens(cfg.val_path, dtype=cfg.dtype)
+
+    # Build model and optimizer
+    device = torch.device(cfg.device)
+    model = TinyLM(cfg.vocab_size, cfg.d_model).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr_max,
+        betas=(cfg.betas0, cfg.betas1),
+        eps=cfg.eps,
+        weight_decay=cfg.weight_decay,
+    )
+
+    # Resume from checkpoint if requested
+    start_step = 0
+    ckpt_file = Path(cfg.ckpt_path)
+    ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+    if cfg.resume and ckpt_file.exists():
+        start_step = load_checkpoint(ckpt_file, model, optimizer)
+        print(f"[resume] loaded checkpoint at step {start_step}")
+
+    # Optional wandb logging
+    wandb = try_init_wandb(cfg.wandb, cfg.wandb_project, cfg.wandb_name, asdict(cfg))
+
+    # ----------------------------
+    # Training loop
+    # ----------------------------
+    model.train()
+    t0 = time.time()
+
+    for step in range(start_step, cfg.steps):
+        # Set learning rate for this step using schedule
+        lr = get_lr_cosine_schedule(step, cfg.lr_max, cfg.lr_min, cfg.warmup_steps, cfg.cosine_steps)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+        # Get a random training batch
+        xb, yb = get_batch_from_memmap(train_tokens, cfg.batch_size, cfg.context_length, cfg.device)
+
+        # Forward pass: get predictions
+        logits = model(xb)  # (B,T,V)
+
+        # Compute cross-entropy loss vs the next-token targets
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
+
+        # Backward pass: compute gradients
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # Clip gradients for stability
+        if cfg.grad_clip_norm is not None and cfg.grad_clip_norm > 0:
+            clip_gradients(model.parameters(), cfg.grad_clip_norm)
+
+        # Update model weights
+        optimizer.step()
+
+        # Print training info every log_every steps
+        if (step + 1) % cfg.log_every == 0:
+            dt = time.time() - t0
+            toks = cfg.batch_size * cfg.context_length * cfg.log_every
+            tok_per_s = toks / max(1e-9, dt)
+            msg = f"step {step+1:6d} | loss {loss.item():.4f} | lr {lr:.2e} | tok/s {tok_per_s:.0f}"
+            print(msg)
+
+            # Log to wandb if enabled
+            if wandb is not None:
+                wandb.log({"train/loss": float(loss.item()), "train/lr": lr, "train/tok_per_s": tok_per_s}, step=step + 1)
+
+            # Reset timer for the next logging window
+            t0 = time.time()
+
+        # Run evaluation every eval_every steps
+        if (step + 1) % cfg.eval_every == 0:
+            val_loss = estimate_loss(model, val_tokens, cfg.eval_batches, cfg.batch_size, cfg.context_length, cfg.device)
+            print(f"           eval | val_loss {val_loss:.4f}")
+            if wandb is not None:
+                wandb.log({"val/loss": val_loss}, step=step + 1)
+
+        # Save checkpoint every save_every steps
+        if (step + 1) % cfg.save_every == 0:
+            save_checkpoint(model, optimizer, step + 1, ckpt_file)
+            print(f"[ckpt] saved to {ckpt_file}")
+
+    # Save final checkpoint at the end
+    save_checkpoint(model, optimizer, cfg.steps, ckpt_file)
+    print(f"[done] saved final checkpoint to {ckpt_file}")
+
+    # Close wandb run
+    if wandb is not None:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
